@@ -226,28 +226,71 @@ async function verifyIdentity(msg) {
 
 /* ========= SIGNALING ========= */
 let wsPort = null;
+let wsHost = null;
 let ws = null;
 let helloInterval = null; // Track the HELLO interval to prevent duplicates
 
+function getSignalingDefaults() {
+  const params = new URLSearchParams(window.location.search);
+  const queryHost = params.get("signalHost");
+  const queryPort = params.get("signalPort");
+
+  const savedHost = localStorage.getItem("signalHost");
+  const savedPort = localStorage.getItem("signalPort");
+
+  const host = queryHost || savedHost || window.location.hostname || "localhost";
+  const port = queryPort || savedPort || "8080";
+  return { host, port };
+}
+
+function connectSignalingSocket() {
+  const url = `ws://${wsHost}:${wsPort}`;
+  log(`🌐 Connecting to signaling node at ${url}`);
+  ws = new WebSocket(url);
+  initializeWebSocket_SetupHandlers(ws);
+}
+
 // Initialize WebSocket connection
 function initializeWebSocket() {
-  // Prompt for WebSocket port
+  const defaults = getSignalingDefaults();
+
+  // Prompt for signaling endpoint (host:port or just port)
   try {
-    wsPort = prompt("Enter WS port:");
-    if (!wsPort || !wsPort.trim()) {
-      alert("WebSocket port is required!");
-      throw new Error("Port required");
+    const endpoint = prompt(
+      "Enter signaling server (host:port or port only):",
+      `${defaults.host}:${defaults.port}`
+    );
+
+    if (!endpoint || !endpoint.trim()) {
+      alert("Signaling endpoint is required!");
+      throw new Error("Signaling endpoint required");
     }
-    wsPort = wsPort.trim();
+
+    const cleaned = endpoint.trim();
+    if (cleaned.includes(":")) {
+      const pieces = cleaned.split(":");
+      wsHost = pieces.slice(0, -1).join(":").trim();
+      wsPort = pieces[pieces.length - 1].trim();
+    } else {
+      wsHost = defaults.host;
+      wsPort = cleaned;
+    }
+
+    if (!wsHost || !wsPort) {
+      alert("Both host and port are required!");
+      throw new Error("Invalid signaling endpoint");
+    }
+
+    localStorage.setItem("signalHost", wsHost);
+    localStorage.setItem("signalPort", wsPort);
   } catch (e) {
-    console.error("No port provided:", e);
-    log("❌ WebSocket port is required to connect");
+    console.error("No signaling endpoint provided:", e);
+    log("❌ Signaling endpoint is required to connect");
     return;
   }
 
   try {
-    ws = new WebSocket(`ws://localhost:${wsPort}`);
-    initializeWebSocket_SetupHandlers(ws);
+    connectSignalingSocket();
   } catch (e) {
     console.error("WebSocket creation failed:", e);
     log("❌ Failed to connect to signaling server");
@@ -286,17 +329,15 @@ function initializeWebSocket_SetupHandlers(socket) {
     if (helloInterval) clearInterval(helloInterval);
     setTimeout(() => {
       try {
-        ws = new WebSocket(`ws://localhost:${wsPort}`);
         log("🔄 Reconnection attempted");
-        // Reuse the same initialization handlers on the new connection
-        initializeWebSocket_SetupHandlers(ws);
+        connectSignalingSocket();
       } catch (e) {
         console.error("Reconnection failed:", e);
       }
     }, 5000);
   };
 
-  ws.onmessage = async (e) => {
+  socket.onmessage = async (e) => {
     const msg = JSON.parse(e.data);
     if (msg.from === myId) return;
 

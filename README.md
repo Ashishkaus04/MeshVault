@@ -57,11 +57,15 @@ Node.js (signaling)
 
 ## Running the Project
 
-Start the signaling node: node node-peer.js <ws-port>
+Start signaling on one machine: node node-peer.js <ws-port>
 
-Open index.html in multiple browser tabs/devices
+Find that machine's LAN IP (example: 192.168.1.42)
 
-Enter different WebSocket ports when prompted
+Open the frontend on all devices and enter the same signaling endpoint when prompted
+
+Example endpoint: 192.168.1.42:8080
+
+Allow inbound firewall rules for the WebSocket port and UDP 55555 on the signaling host
 
 ## Current Limitations
 
