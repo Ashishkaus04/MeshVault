@@ -42,6 +42,7 @@ function App() {
     // Poll for peer updates (since browser.js doesn't have events)
     const peerUpdateInterval = setInterval(() => {
       browserAdapter.updatePeerList();
+      browserAdapter.syncIncomingMessages();
       browserAdapter.syncIncomingFileProgress();
       // Trigger a state update to ensure monitoring dashboard gets fresh data
       setState(prevState => ({ ...prevState }));

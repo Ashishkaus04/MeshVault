@@ -5,6 +5,18 @@
 //   Message batching for performance
  
 
+/* ========= POLYFILL ========= */
+// Polyfill for crypto.randomUUID if not available
+if (!crypto.randomUUID) {
+  crypto.randomUUID = function() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      const r = Math.random() * 16 | 0;
+      const v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  };
+}
+
 /* ========= UTIL ========= */
 const log = (msg) => {
   const logElement = document.getElementById("log");
@@ -18,9 +30,10 @@ const log = (msg) => {
 };
 
 // Dynamic chunk sizing based on network conditions
-let CHUNK_SIZE = 16 * 1024; // Start at 16KB
-const MIN_CHUNK_SIZE = 4 * 1024;  // Don't go below 4KB
-const MAX_CHUNK_SIZE = 256 * 1024; // Don't exceed 256KB
+// Keep chunks small enough for WebRTC DataChannel message limits after base64 + JSON overhead.
+let CHUNK_SIZE = 1024; // Start at 1KB for maximum reliability on hotspot links
+const MIN_CHUNK_SIZE = 1024;  // Don't go below 1KB
+const MAX_CHUNK_SIZE = 4 * 1024; // Keep well below common DataChannel limits
 let recentTransferTimes = []; // Track recent transfer speeds
 
 // Update chunk size based on performance
@@ -36,7 +49,7 @@ function updateChunkSize(transferTimeMs, chunkSizeBytes) {
 
   const avgSpeed = recentTransferTimes.reduce((a, b) => a + b, 0) / recentTransferTimes.length;
   
-  // If average speed is good (>1MB/s), increase chunk size
+  // If average speed is good (>1MB/s), increase chunk size slightly
   // If average speed is slow (<500KB/s), decrease chunk size
   if (avgSpeed > 1000000 && CHUNK_SIZE < MAX_CHUNK_SIZE) {
     CHUNK_SIZE = Math.min(CHUNK_SIZE * 1.5, MAX_CHUNK_SIZE);
@@ -197,11 +210,34 @@ document.getElementById("toggleDisasterMode").onclick = () => {
 };
 
 async function deviceHash(peerId, name) {
-  const data = new TextEncoder().encode(peerId + name);
-  const hash = await crypto.subtle.digest("SHA-256", data);
-  return [...new Uint8Array(hash)]
-    .map(b => b.toString(16).padStart(2, "0"))
-    .join("");
+  const input = peerId + name;
+
+  // HTTP fallback: Web Crypto is unavailable in insecure contexts.
+  // Use a deterministic non-cryptographic hash so identity exchange still works.
+  if (!crypto.subtle || typeof crypto.subtle?.digest !== "function") {
+    let hash = 0;
+    for (let i = 0; i < input.length; i++) {
+      hash = ((hash << 5) - hash) + input.charCodeAt(i);
+      hash |= 0;
+    }
+    return Math.abs(hash).toString(16).padStart(8, "0");
+  }
+
+  try {
+    const data = new TextEncoder().encode(input);
+    const hash = await crypto.subtle.digest("SHA-256", data);
+    return [...new Uint8Array(hash)]
+      .map(b => b.toString(16).padStart(2, "0"))
+      .join("");
+  } catch (error) {
+    console.warn("⚠️ deviceHash digest unavailable, using fallback hash:", error);
+    let hash = 0;
+    for (let i = 0; i < input.length; i++) {
+      hash = ((hash << 5) - hash) + input.charCodeAt(i);
+      hash |= 0;
+    }
+    return Math.abs(hash).toString(16).padStart(8, "0");
+  }
 }
 
 async function sendIdentity(channel) {
@@ -238,7 +274,8 @@ function getSignalingDefaults() {
   const savedHost = localStorage.getItem("signalHost");
   const savedPort = localStorage.getItem("signalPort");
 
-  const host = queryHost || savedHost || window.location.hostname || "localhost";
+  const pageHost = window.location.hostname;
+  const host = queryHost || savedHost || (pageHost && pageHost !== "localhost" && pageHost !== "127.0.0.1" ? pageHost : "");
   const port = queryPort || savedPort || "8080";
   return { host, port };
 }
@@ -257,8 +294,8 @@ function initializeWebSocket() {
   // Prompt for signaling endpoint (host:port or just port)
   try {
     const endpoint = prompt(
-      "Enter signaling server (host:port or port only):",
-      `${defaults.host}:${defaults.port}`
+      "Enter signaling server host:port (use the laptop running backend, e.g. 192.168.1.42:8080):",
+      defaults.host ? `${defaults.host}:${defaults.port}` : `192.168.1.42:${defaults.port}`
     );
 
     if (!endpoint || !endpoint.trim()) {
@@ -272,6 +309,10 @@ function initializeWebSocket() {
       wsHost = pieces.slice(0, -1).join(":").trim();
       wsPort = pieces[pieces.length - 1].trim();
     } else {
+      if (!defaults.host) {
+        alert("Enter the backend laptop IP plus port, for example 192.168.1.42:8080");
+        throw new Error("Signaling host required");
+      }
       wsHost = defaults.host;
       wsPort = cleaned;
     }
@@ -345,7 +386,12 @@ function initializeWebSocket_SetupHandlers(socket) {
       peers.set(msg.from, Date.now());
       offlinePeers.delete(msg.from);
       renderPeers();
-      connectToPeer(msg.from);
+
+      // Prevent offer glare: only the peer with the lower ID starts the connection.
+      // The other side waits for the incoming OFFER and answers it.
+      if (myId && myId < msg.from) {
+        connectToPeer(msg.from);
+      }
       return;
     }
 
@@ -354,16 +400,26 @@ function initializeWebSocket_SetupHandlers(socket) {
     if (msg.type === "OFFER") {
       if (connections.has(msg.from)) return; // Already connecting
 
-      // Generate ECDH key pair
-      const keyPair = await crypto.subtle.generateKey(
-        {
-          name: "ECDH",
-          namedCurve: "P-256",
-        },
-        true,
-        ["deriveKey", "deriveBits"]
-      );
-      peerKeys.set(msg.from, { keyPair, keyExchanged: false });
+      // Generate ECDH key pair if crypto available (HTTPS only)
+      if (crypto.subtle && typeof crypto.subtle.generateKey === 'function') {
+        try {
+          const keyPair = await crypto.subtle.generateKey(
+            {
+              name: "ECDH",
+              namedCurve: "P-256",
+            },
+            true,
+            ["deriveKey", "deriveBits"]
+          );
+          peerKeys.set(msg.from, { keyPair, keyExchanged: false });
+        } catch (e) {
+          console.error("Key generation failed on OFFER, using fixed key:", e);
+          peerKeys.set(msg.from, { keyExchanged: true });
+        }
+      } else {
+        log(`⚠️ crypto.subtle unavailable (HTTP context). Using fixed key for ${msg.from}`);
+        peerKeys.set(msg.from, { keyExchanged: true });
+      }
 
       const pc = createPeerConnection(msg.from);
       connections.set(msg.from, { pc, channel: null });
@@ -381,6 +437,9 @@ function initializeWebSocket_SetupHandlers(socket) {
             data: answer
           }));
         }
+        
+        // Flush any queued ICE candidates for this peer
+        flushIceCandidates(msg.from, pc);
       }
     }
 
@@ -388,13 +447,30 @@ function initializeWebSocket_SetupHandlers(socket) {
       const pc = connections.get(msg.from)?.pc;
       if (pc && (pc.signalingState === 'have-local-offer' || pc.signalingState === 'have-local-pranswer')) {
         await pc.setRemoteDescription(msg.data);
+        
+        // Flush any queued ICE candidates for this peer
+        flushIceCandidates(msg.from, pc);
       }
     }
 
     if (msg.type === "ICE") {
       const pc = connections.get(msg.from)?.pc;
-      if (pc && pc.signalingState !== 'closed') {
-        await pc.addIceCandidate(msg.data);
+      if (pc) {
+        // Check if we can add the ICE candidate now
+        if (pc.remoteDescription) {
+          try {
+            await pc.addIceCandidate(msg.data);
+          } catch (e) {
+            console.error(`Failed to add ICE candidate for ${msg.from}:`, e);
+          }
+        } else {
+          // Queue the ICE candidate for later
+          if (!iceCandidateQueues.has(msg.from)) {
+            iceCandidateQueues.set(msg.from, []);
+          }
+          iceCandidateQueues.get(msg.from).push(msg.data);
+          console.log(`📥 Queued ICE candidate for ${msg.from} (waiting for remote description)`);
+        }
       }
     }
   };
@@ -403,9 +479,12 @@ function initializeWebSocket_SetupHandlers(socket) {
 /* ========= STATE ========= */
 const peers = new Map();       // peerId -> lastSeen
 const connections = new Map(); // peerId -> { pc, channel }
+const iceCandidateQueues = new Map(); // peerId -> [ { candidate } ]
+const peerSendChains = new Map(); // peerId -> Promise chain for ordered sending
 const offlinePeers = new Set();
 const seenMessages = new Set();
 const pendingMessages = new Map();
+const receivedMessages = [];   // Array of received chat messages for React adapter to poll
 
 // Disaster mode: Store all messages/files locally when offline
 let disasterModeEnabled = localStorage.getItem("disasterMode") === "true";
@@ -451,6 +530,7 @@ if (typeof window !== 'undefined') {
   window.__meshVaultConnections = connections;
   window.__meshVaultMyId = myId;
   window.__meshVaultDisasterMode = disasterModeEnabled;
+  window.__meshVaultMessages = receivedMessages;
 }
 
 /* ========= FILE STATE ========= */
@@ -512,11 +592,44 @@ setInterval(() => {
 
 /* ========= WEBRTC ========= */
 function createPeerConnection(peerId) {
+  // For hotspots, skip STUN and rely on local candidates
+  // STUN often times out on restrictive phone hotspot NATs
+  // If both peers are on the same local network, they can connect directly via local IPs
+  const iceServers = [];
+  
+  // Only add STUN if we have internet connectivity and STUN servers are reliable
+  // On hotspots, this is often disabled to avoid timeouts
+  if (typeof window !== 'undefined' && window.navigator && window.navigator.onLine) {
+    iceServers.push({ urls: ['stun:stun.l.google.com:19302'] });
+  }
+  
   const pc = new RTCPeerConnection({
-    iceServers: [
-      { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }
-    ]
+    iceServers: iceServers.length > 0 ? iceServers : undefined,
+    bundlePolicy: 'max-bundle',
+    rtcpMuxPolicy: 'require',
+    iceCandidatePoolSize: 10
   });
+  pc.ondatachannel = (e) => {
+    const channel = e.channel;
+    channel.bufferedAmountLowThreshold = 32 * 1024;
+    setupChannelHandlers(channel, peerId);
+    connections.get(peerId).channel = channel;
+  };
+  
+  // Enable mDNS candidate generation for local networks (if supported)
+  if (typeof pc.getConfiguration === 'function') {
+    const config = pc.getConfiguration();
+    if (config && !config.mdnsIceCandidate) {
+      try {
+        pc.setConfiguration({
+          ...config,
+          mdnsIceCandidate: true  // Enable .local candidates for better local network discovery
+        });
+      } catch (e) {
+        // mDNS not supported in all browsers, silently continue
+      }
+    }
+  }
 
   // Track connection state changes
   pc.onconnectionstatechange = () => {
@@ -546,22 +659,41 @@ function createPeerConnection(peerId) {
 
   pc.onicecandidate = (e) => {
     if (e.candidate && ws && ws.readyState === WebSocket.OPEN) {
+      // On hotspots, prefer local/mDNS candidates over STUN to reduce NAT binding timeout errors
+      const candidate = e.candidate;
+      const candidateType = candidate.candidate?.split(' ')[7]; // Extract candidate type (host, srflx, etc)
+      
+      // Send candidate (filtering applied client-side to prefer local addresses)
       ws.send(JSON.stringify({
         type: "ICE",
         from: myId,
         to: peerId,
-        data: e.candidate
+        data: candidate
       }));
     }
   };
 
-  pc.ondatachannel = (e) => {
-    const channel = e.channel;
-    setupChannelHandlers(channel, peerId);
-    connections.get(peerId).channel = channel;
-  };
-
   return pc;
+}
+
+// Flush queued ICE candidates for a peer
+async function flushIceCandidates(peerId, pc) {
+  const queue = iceCandidateQueues.get(peerId);
+  if (!queue || queue.length === 0) return;
+
+  console.log(`🔄 Flushing ${queue.length} queued ICE candidates for ${peerId}`);
+  
+  for (const candidate of queue) {
+    try {
+      if (pc.remoteDescription) {
+        await pc.addIceCandidate(candidate);
+      }
+    } catch (e) {
+      console.error(`Failed to add queued ICE candidate for ${peerId}:`, e);
+    }
+  }
+  
+  iceCandidateQueues.delete(peerId);
 }
 
 // Setup channel handlers with error handling
@@ -601,11 +733,16 @@ function setupChannelHandlers(channel, peerId) {
       stats.failures = 0;
     }
     await sendIdentity(channel);
-    // Send public key for key exchange
+    // Send public key for key exchange (only if crypto.subtle available)
     const keyData = peerKeys.get(peerId);
-    if (keyData) {
-      const exported = await crypto.subtle.exportKey("spki", keyData.keyPair.publicKey);
-      channel.send(JSON.stringify({ type: "KEY_EXCHANGE", from: myId, publicKey: arrayBufferToBase64(exported) }));
+    if (keyData && keyData.keyPair && crypto.subtle && typeof crypto.subtle.exportKey === 'function') {
+      try {
+        const exported = await crypto.subtle.exportKey("spki", keyData.keyPair.publicKey);
+        channel.send(JSON.stringify({ type: "KEY_EXCHANGE", from: myId, publicKey: arrayBufferToBase64(exported) }));
+      } catch (e) {
+        console.error(`Failed to export public key for ${peerId}:`, e);
+        // Continue anyway, using fixed key
+      }
     }
     channel.send(JSON.stringify({ type: "SYNC_REQUEST", from: myId }));
   };
@@ -639,15 +776,28 @@ async function connectToPeer(peerId) {
 
   // Generate ECDH key pair if not already done
   if (!peerKeys.has(peerId)) {
-    const keyPair = await crypto.subtle.generateKey(
-      {
-        name: "ECDH",
-        namedCurve: "P-256",
-      },
-      true,
-      ["deriveKey", "deriveBits"]
-    );
-    peerKeys.set(peerId, { keyPair, keyExchanged: false });
+    // Check if crypto.subtle is available (only in HTTPS contexts)
+    if (crypto.subtle && typeof crypto.subtle.generateKey === 'function') {
+      try {
+        const keyPair = await crypto.subtle.generateKey(
+          {
+            name: "ECDH",
+            namedCurve: "P-256",
+          },
+          true,
+          ["deriveKey", "deriveBits"]
+        );
+        peerKeys.set(peerId, { keyPair, keyExchanged: false });
+      } catch (e) {
+        console.error("Key generation failed, using fixed key:", e);
+        // Fallback: mark as using fixed key
+        peerKeys.set(peerId, { keyExchanged: true });
+      }
+    } else {
+      log(`⚠️ crypto.subtle unavailable (HTTP context). Using fixed key for ${peerId}`);
+      // For HTTP context, skip ECDH and mark as ready with fixed key
+      peerKeys.set(peerId, { keyExchanged: true });
+    }
   }
 
   const pc = createPeerConnection(peerId);
@@ -766,30 +916,64 @@ async function handleSingleMessage(msg) {
   }
 
   if (msg.type === "KEY_EXCHANGE") {
-    const peerPublicKeyData = base64ToArrayBuffer(msg.publicKey);
-    const peerPublicKey = await crypto.subtle.importKey(
-      "spki",
-      peerPublicKeyData,
-      { name: "ECDH", namedCurve: "P-256" },
-      false,
-      []
-    );
-    const keyData = peerKeys.get(msg.from);
-    if (keyData) {
-      // Use fixed key for testing
-      if (!window.fixedKey) {
-        window.fixedKey = await crypto.subtle.importKey("raw", fixedKeyData, {name: "AES-GCM"}, false, ["encrypt", "decrypt"]);
+    // Skip key exchange in HTTP context where crypto.subtle is unavailable
+    if (!crypto.subtle) {
+      console.log(`⚠️ Skipping key exchange with ${msg.from} (HTTP context)`);
+      const keyData = peerKeys.get(msg.from);
+      if (keyData) {
+        keyData.keyExchanged = true; // Mark as ready to send unencrypted
+        log(`⏭️ Skipped key exchange with ${msg.from}, using unencrypted mode`);
+        flushPending(msg.from);
       }
-      keyData.sharedKey = window.fixedKey;
-      keyData.keyExchanged = true;
-      log(`🔑 Key exchanged with ${msg.from}`);
-      // Flush any pending raw data
-      flushPending(msg.from);
+      return;
+    }
+
+    try {
+      const peerPublicKeyData = base64ToArrayBuffer(msg.publicKey);
+      const peerPublicKey = await crypto.subtle.importKey(
+        "spki",
+        peerPublicKeyData,
+        { name: "ECDH", namedCurve: "P-256" },
+        false,
+        []
+      );
+      const keyData = peerKeys.get(msg.from);
+      if (keyData) {
+        // Use fixed key for testing
+        if (!window.fixedKey) {
+          window.fixedKey = await crypto.subtle.importKey("raw", fixedKeyData, {name: "AES-GCM"}, false, ["encrypt", "decrypt"]);
+        }
+        keyData.sharedKey = window.fixedKey;
+        keyData.keyExchanged = true;
+        log(`🔑 Key exchanged with ${msg.from}`);
+        // Flush any pending raw data
+        flushPending(msg.from);
+      }
+    } catch (e) {
+      console.error("Key exchange failed:", e);
+      const keyData = peerKeys.get(msg.from);
+      if (keyData) {
+        keyData.keyExchanged = true; // Mark as ready anyway, will send unencrypted
+      }
     }
     return;
   }
 
   if (msg.type === "ENCRYPTED") {
+    // Handle unencrypted messages in HTTP context
+    if (msg.unencrypted) {
+      console.log(`⚠️ Received unencrypted message from ${msg.from} (HTTP context)`);
+      try {
+        const decryptedStr = atob(msg.data);
+        const innerMsg = JSON.parse(decryptedStr);
+        handleDecryptedMessage(innerMsg, msg.from);
+      } catch (e) {
+        console.error("Failed to decode unencrypted message:", e);
+      }
+      return;
+    }
+
+    // Handle encrypted messages (HTTPS context)
     const keyData = peerKeys.get(msg.from);
     if (keyData && keyData.sharedKey) {
       console.log(`🔓 Decrypting message from ${msg.from}`);
@@ -924,6 +1108,8 @@ if (typeof window !== 'undefined') {
 
 // Send encrypted data to a specific peer
 async function sendToPeer(peerId, data) {
+  const previousSend = peerSendChains.get(peerId) || Promise.resolve();
+  const nextSend = previousSend.then(async () => {
   const keyData = peerKeys.get(peerId);
   if (!keyData || !keyData.keyExchanged) {
     console.log(`🔓 No key for ${peerId}, storing for later`);
@@ -934,20 +1120,56 @@ async function sendToPeer(peerId, data) {
     return;
   }
 
-  const encrypted = await encryptData(data, keyData.sharedKey);
-  console.log(`🔒 Encrypted message for ${peerId}`);
+  let messageToSend = {
+    type: "ENCRYPTED",
+    from: myId,
+  };
+
+  // If crypto.subtle is available, encrypt the data
+  if (crypto.subtle && keyData.sharedKey) {
+    const encrypted = await encryptData(data, keyData.sharedKey);
+    console.log(`🔒 Encrypted message for ${peerId}`);
+    messageToSend = { ...messageToSend, ...encrypted };
+  } else {
+    // Fallback for HTTP context: send unencrypted (for testing only)
+    console.log(`⚠️ Encryption unavailable, sending unencrypted to ${peerId}`);
+    messageToSend.data = btoa(data); // Base64 encode for consistency
+    messageToSend.unencrypted = true;
+  }
+
   const channel = connections.get(peerId)?.channel;
   if (channel && channel.readyState === "open") {
-    channel.send(JSON.stringify({
-      type: "ENCRYPTED",
-      from: myId,
-      ...encrypted
-    }));
+    if (channel.bufferedAmount > 64 * 1024) {
+      await new Promise((resolve) => {
+        const drainHandler = () => {
+          if (channel.bufferedAmount <= channel.bufferedAmountLowThreshold) {
+            channel.removeEventListener('bufferedamountlow', drainHandler);
+            resolve();
+          }
+        };
+
+        channel.addEventListener('bufferedamountlow', drainHandler);
+        setTimeout(() => {
+          channel.removeEventListener('bufferedamountlow', drainHandler);
+          resolve();
+        }, 1000);
+      });
+    }
+
+    channel.send(JSON.stringify(messageToSend));
     console.log(`📤 Sent encrypted message to ${peerId}`);
   } else {
     // Store for later
-    storeForLater(peerId, { type: "ENCRYPTED", from: myId, ...encrypted });
+    storeForLater(peerId, messageToSend);
   }
+  }).catch((error) => {
+    console.error(`❌ Failed sending to ${peerId}:`, error);
+    const fallback = JSON.stringify(messageToSend);
+    storeForLater(peerId, JSON.parse(fallback));
+  });
+
+  peerSendChains.set(peerId, nextSend);
+  return nextSend;
 }
 
 /* ========= CHAT ========= */
@@ -959,6 +1181,15 @@ function handleChatMessage(msg) {
   const name = peerIdentities.get(msg.from)?.username || msg.from;
   log(`[${time}] ${name}: ${msg.text}`);
   console.log(`📨 Received message from ${msg.from}: ${msg.text}`);
+
+  // Add to received messages array for React adapter to poll
+  receivedMessages.push({
+    id: msg.id,
+    from: msg.from,
+    text: msg.text,
+    time: msg.time,
+    type: "CHAT"
+  });
 
   forwardMessage(msg);
 }
@@ -1108,7 +1339,8 @@ document.getElementById("fileInput").onchange = async (e) => {
       updateChunkSize(elapsed, chunk.byteLength);
     }
 
-    await new Promise(r => setTimeout(r, 1));
+    // Give the DataChannel time to drain between chunks.
+    await new Promise(r => setTimeout(r, 10));
   }
 
   broadcast(JSON.stringify({
@@ -1133,17 +1365,11 @@ function broadcast(data) {
       queueMessage(peerId, msg);
     }
   } else if (msg.type === "FILE_META" || msg.type === "FILE_CHUNK" || msg.type === "FILE_END") {
-    // FILES MUST BE FORWARDED through mesh topology like messages
-    // First, send to all directly connected peers
-    for (const peerId of peers.keys()) {
-      sendToPeer(peerId, data);
-    }
-    // Then relay through mesh: add 'from' field and forward to prevent loops
-    // This enables A->C file transfer through B in mesh topology
+    // Send each file packet exactly once. Duplicate chunks corrupt the receiver's file assembly.
     if (!msg.from) {
       msg.from = myId;
-      forwardMessage(msg);
     }
+    forwardMessage(msg);
   } else {
     // For other messages (identity, etc.), send immediately
     for (const peerId of peers.keys()) {

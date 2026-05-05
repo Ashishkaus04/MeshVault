@@ -10,7 +10,7 @@ The project focuses on networking fundamentals and protocol design, with securit
 
 🔗 Peer-to-Peer Mesh Networking using WebRTC
 
-🌐 Decentralized Peer Discovery via WebSocket + UDP broadcast
+🌐 Decentralized Peer Discovery via WebSocket signaling
 
 💬 Real-Time Chat Messaging
 
@@ -34,10 +34,11 @@ Encryption is currently functional but not fully hardened.
 
 The system is designed to support complete E2EE in future iterations.
 
- ## Architecture
+## Architecture
+
 Browser ↔ Browser  (WebRTC DataChannels)
         ↕
-   Signaling Node (WebSocket + UDP)
+   Signaling Node (WebSocket)
 
 Signaling is used only for discovery and connection setup
 
@@ -57,15 +58,31 @@ Node.js (signaling)
 
 ## Running the Project
 
-Start signaling on one machine: node node-peer.js <ws-port>
+Use one laptop as the signaling host, then connect the second laptop to that same IP over the hotspot.
 
-Find that machine's LAN IP (example: 192.168.1.42)
+On the signaling host laptop:
 
-Open the frontend on all devices and enter the same signaling endpoint when prompted
+npm --prefix backend start
 
-Example endpoint: 192.168.1.42:8080
+Start the frontend dev server on the same laptop:
 
-Allow inbound firewall rules for the WebSocket port and UDP 55555 on the signaling host
+npm --prefix frontend run dev
+
+Find the signaling host laptop LAN IP on the hotspot network, for example 192.168.1.42.
+
+Open the frontend from both laptops using the same frontend URL:
+
+http://192.168.1.42:3000
+
+When prompted on each laptop, enter the signaling endpoint hosted by the backend machine:
+
+192.168.1.42:8080
+
+Allow inbound firewall rules on the signaling host laptop:
+
+TCP 8080 (or chosen WS port)
+
+If you open the frontend from a different machine, do not leave the signaling host as localhost; it must be the LAN IP of the laptop running npm --prefix backend start.
 
 ## Current Limitations
 

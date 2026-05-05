@@ -90,11 +90,13 @@ wss.on("connection", (socket) => {
   console.log(`🌐 Browser connected on WS ${WS_HOST}:${WS_PORT}`);
 
   socket.on("message", (data) => {
-    udp.send(
-      Buffer.from(data.toString()),
-      SIGNALING_PORT,
-      "255.255.255.255"
-    );
+    const payload = data.toString();
+
+    wss.clients.forEach((client) => {
+      if (client !== socket && client.readyState === WebSocket.OPEN) {
+        client.send(payload);
+      }
+    });
   });
 
   socket.on("close", () => {

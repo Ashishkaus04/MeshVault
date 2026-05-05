@@ -23,6 +23,9 @@ class BrowserAdapter {
     
     // Track files by signature (name+size+from) to prevent duplicate files with different IDs
     this.seenFileSignatures = new Set();
+    
+    // Track processed message IDs to ensure all messages are synced (even in batches)
+    this.processedMessageIds = new Set();
 
     // React state updater function (set by App component)
     this.updateState = null;
@@ -302,11 +305,16 @@ class BrowserAdapter {
         const isOnline = (now - lastSeen) <= PEER_TIMEOUT;
         const identity = window.__meshVaultPeerIdentities.get(peerId);
         const connection = window.__meshVaultConnections?.get(peerId);
+        const pcState = connection?.pc?.connectionState;
+        const iceState = connection?.pc?.iceConnectionState;
+        const channelState = connection?.channel?.readyState;
         
         let status = 'offline';
         if (isOnline) {
-          if (connection?.channel?.readyState === 'open') {
+          if (channelState === 'open' || pcState === 'connected' || pcState === 'completed') {
             status = 'connected';
+          } else if (pcState === 'failed' || pcState === 'disconnected' || iceState === 'failed') {
+            status = 'offline';
           } else if (connection) {
             status = 'connecting';
           } else {
@@ -326,6 +334,30 @@ class BrowserAdapter {
       this.notifyUpdate();
     } catch (error) {
       console.error('Error updating peer list:', error);
+    }
+  }
+
+  // Sync incoming messages from browser.js to React state
+  syncIncomingMessages() {
+    if (typeof window === 'undefined' || !window.__meshVaultMessages) {
+      return;
+    }
+
+    try {
+      const browserMessages = window.__meshVaultMessages || [];
+      
+      // Process all messages, tracking by ID to catch any that haven't been synced yet
+      for (const msg of browserMessages) {
+        if (msg && msg.id && msg.text && !this.processedMessageIds.has(msg.id)) {
+          // Mark as processed BEFORE calling handleMessage to prevent duplicates
+          this.processedMessageIds.add(msg.id);
+          
+          // Add the new message to state
+          this.handleMessage(msg);
+        }
+      }
+    } catch (error) {
+      console.error('Error syncing incoming messages:', error);
     }
   }
 
@@ -559,28 +591,46 @@ class BrowserAdapter {
       return;
     }
 
-    // ONLY sync progress for files already in our state - never add new files here
-    // New files should ONLY come through handleFileStart (via FILE_META event)
+    // Sync progress for files in browser.js and create missing React entries when needed.
     let updated = false;
-    const updatedFiles = this.state.incomingFiles.map(file => {
-      const entry = incomingFilesMap.get(file.fileId);
-      if (entry && entry.meta) {
-        const progress = Math.floor((entry.receivedSize / entry.meta.size) * 100);
-        
-        // Update progress if changed
-        if (Math.abs(file.progress - progress) > 1) {
-          updated = true;
-          return { ...file, progress };
-        }
-        
-        // Also check if download URL is ready
-        if (entry.downloadUrl && !file.downloadUrl) {
-          updated = true;
-          return { ...file, downloadUrl: entry.downloadUrl, progress: 100 };
-        }
+    const updatedFiles = [...this.state.incomingFiles];
+
+    for (const [fileId, entry] of incomingFilesMap.entries()) {
+      if (!entry || !entry.meta) continue;
+
+      const progress = Math.floor((entry.receivedSize / entry.meta.size) * 100);
+      const existingIndex = updatedFiles.findIndex(file => file.fileId === fileId);
+
+      if (existingIndex === -1) {
+        updated = true;
+        updatedFiles.push({
+          fileId,
+          name: entry.meta.name,
+          size: entry.meta.size,
+          mime: entry.meta.mime || 'application/octet-stream',
+          from: entry.from,
+          progress: entry.downloadUrl ? 100 : progress,
+          downloadUrl: entry.downloadUrl || null
+        });
+        continue;
       }
-      return file;
-    });
+
+      const current = updatedFiles[existingIndex];
+      const nextFile = { ...current };
+
+      if (Math.abs(current.progress - progress) > 1) {
+        nextFile.progress = progress;
+        updated = true;
+      }
+
+      if (entry.downloadUrl && !current.downloadUrl) {
+        nextFile.downloadUrl = entry.downloadUrl;
+        nextFile.progress = 100;
+        updated = true;
+      }
+
+      updatedFiles[existingIndex] = nextFile;
+    }
     
     if (updated) {
       this.state.incomingFiles = updatedFiles;
