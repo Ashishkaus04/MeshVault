@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: meshvault
+    env: docker
+    plan: free
+    autoDeploy: true

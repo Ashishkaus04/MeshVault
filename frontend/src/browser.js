@@ -266,6 +266,10 @@ let wsHost = null;
 let ws = null;
 let helloInterval = null; // Track the HELLO interval to prevent duplicates
 
+function isLocalHost(host) {
+  return host === "localhost" || host === "127.0.0.1";
+}
+
 function getSignalingDefaults() {
   const params = new URLSearchParams(window.location.search);
   const queryHost = params.get("signalHost");
@@ -273,15 +277,22 @@ function getSignalingDefaults() {
 
   const savedHost = localStorage.getItem("signalHost");
   const savedPort = localStorage.getItem("signalPort");
-
   const pageHost = window.location.hostname;
-  const host = queryHost || savedHost || (pageHost && pageHost !== "localhost" && pageHost !== "127.0.0.1" ? pageHost : "");
-  const port = queryPort || savedPort || "8080";
+  const pagePort = window.location.port;
+  const defaultPagePort = window.location.protocol === "https:" ? "443" : "80";
+
+  const host = queryHost || savedHost || (pageHost && !isLocalHost(pageHost) ? pageHost : "");
+  const port = queryPort || savedPort || (host && host === pageHost ? (pagePort || defaultPagePort) : "8080");
   return { host, port };
 }
 
 function connectSignalingSocket() {
-  const url = `ws://${wsHost}:${wsPort}`;
+  const securePage = window.location.protocol === "https:";
+  const useSecureWs = securePage && !isLocalHost(wsHost);
+  const protocol = useSecureWs ? "wss" : "ws";
+  const hideDefaultPort = (protocol === "wss" && wsPort === "443") || (protocol === "ws" && wsPort === "80");
+  const portPart = wsPort && !hideDefaultPort ? `:${wsPort}` : "";
+  const url = `${protocol}://${wsHost}${portPart}`;
   log(`🌐 Connecting to signaling node at ${url}`);
   ws = new WebSocket(url);
   initializeWebSocket_SetupHandlers(ws);
