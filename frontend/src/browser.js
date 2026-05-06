@@ -265,6 +265,9 @@ let wsPort = null;
 let wsHost = null;
 let ws = null;
 let helloInterval = null; // Track the HELLO interval to prevent duplicates
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
+const RECONNECT_BASE_DELAY = 2000; // Start with 2 seconds
 
 function isLocalHost(host) {
   return host === "localhost" || host === "127.0.0.1";
@@ -304,14 +307,24 @@ function initializeWebSocket() {
 
   // Prompt for signaling endpoint (host:port or just port)
   try {
+    const helpText = `Enter the signaling server address (from the backend server output):
+    
+Examples:
+  - 192.168.1.100:8080 (recommended - use the IP from server output)
+  - 192.168.0.50:8080
+  - 10.0.0.15:8080
+
+Default suggestion:`;
+
     const endpoint = prompt(
-      "Enter signaling server host:port (use the laptop running backend, e.g. 192.168.1.42:8080):",
-      defaults.host ? `${defaults.host}:${defaults.port}` : `192.168.1.42:${defaults.port}`
+      helpText,
+      defaults.host ? `${defaults.host}:${defaults.port}` : `192.168.1.100:8080`
     );
 
     if (!endpoint || !endpoint.trim()) {
-      alert("Signaling endpoint is required!");
-      throw new Error("Signaling endpoint required");
+      alert("Signaling endpoint is required to connect!");
+      log("❌ Setup cancelled - signaling endpoint required");
+      return;
     }
 
     const cleaned = endpoint.trim();
@@ -321,8 +334,8 @@ function initializeWebSocket() {
       wsPort = pieces[pieces.length - 1].trim();
     } else {
       if (!defaults.host) {
-        alert("Enter the backend laptop IP plus port, for example 192.168.1.42:8080");
-        throw new Error("Signaling host required");
+        alert("Please include the port number (e.g., 192.168.1.100:8080)");
+        throw new Error("Port required");
       }
       wsHost = defaults.host;
       wsPort = cleaned;
@@ -333,11 +346,19 @@ function initializeWebSocket() {
       throw new Error("Invalid signaling endpoint");
     }
 
+    // Validate port is numeric
+    if (isNaN(wsPort) || wsPort < 1 || wsPort > 65535) {
+      alert("Port must be a number between 1 and 65535");
+      throw new Error("Invalid port");
+    }
+
     localStorage.setItem("signalHost", wsHost);
     localStorage.setItem("signalPort", wsPort);
+    
+    log(`📍 Connecting to signaling server: ${wsHost}:${wsPort}`);
   } catch (e) {
-    console.error("No signaling endpoint provided:", e);
-    log("❌ Signaling endpoint is required to connect");
+    console.error("Signaling setup failed:", e);
+    log("❌ Failed to configure signaling endpoint: " + e.message);
     return;
   }
 
@@ -345,15 +366,15 @@ function initializeWebSocket() {
     connectSignalingSocket();
   } catch (e) {
     console.error("WebSocket creation failed:", e);
-    log("❌ Failed to connect to signaling server");
-    return;
+    log("❌ Failed to connect to signaling server: " + e.message);
   }
 }
 
 // Setup WebSocket handlers (used for both initial and reconnection)
 function initializeWebSocket_SetupHandlers(socket) {
   socket.onopen = () => {
-    log("🌐 Connected to signaling node");
+    log("✅ Connected to signaling server!");
+    reconnectAttempts = 0; // Reset counter on successful connection
     
     // Clear any previous interval
     if (helloInterval) clearInterval(helloInterval);
@@ -372,21 +393,29 @@ function initializeWebSocket_SetupHandlers(socket) {
   };
 
   socket.onerror = (error) => {
-    log(`❌ WebSocket error: ${error.type}`);
+    log(`❌ Connection error: Check that the server address is correct`);
     console.error("WebSocket error:", error);
   };
 
   socket.onclose = () => {
-    log("🔌 WebSocket disconnected - attempting to reconnect...");
+    log("🔌 Disconnected from signaling server");
     if (helloInterval) clearInterval(helloInterval);
-    setTimeout(() => {
-      try {
-        log("🔄 Reconnection attempted");
-        connectSignalingSocket();
-      } catch (e) {
-        console.error("Reconnection failed:", e);
-      }
-    }, 5000);
+    
+    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      const delay = Math.min(RECONNECT_BASE_DELAY * Math.pow(1.5, reconnectAttempts), 30000);
+      reconnectAttempts++;
+      log(`🔄 Reconnecting in ${Math.round(delay / 1000)}s (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+      
+      setTimeout(() => {
+        try {
+          connectSignalingSocket();
+        } catch (e) {
+          console.error("Reconnection failed:", e);
+        }
+      }, delay);
+    } else {
+      log(`❌ Failed to reconnect after ${MAX_RECONNECT_ATTEMPTS} attempts. Please refresh the page.`);
+    }
   };
 
   socket.onmessage = async (e) => {
